@@ -2,14 +2,16 @@
 #
 # Run the hiring agent in Docker.
 #
-#   ./hiring-agent.sh setup                                  choose Gemini (API key) or Ollama
-#   ./hiring-agent.sh batch applicants.xlsx resumes/ [opts]  rank a sheet of applicants
-#   ./hiring-agent.sh score resume.pdf                       score a single resume
-#   ./hiring-agent.sh build                                  rebuild the image
-#   ./hiring-agent.sh stop                                   stop the bundled Ollama container
+#   ./hiring-agent.sh setup                                         pick a provider from providers.json
+#   ./hiring-agent.sh batch sheet.xlsx resumes/ --role ROLE [opts]  rank a sheet of applicants
+#   ./hiring-agent.sh score resume.pdf --role ROLE                  score a single resume
+#   ./hiring-agent.sh score --init-role NAME                        create a new role under roles/
+#   ./hiring-agent.sh build                                         rebuild the image
+#   ./hiring-agent.sh stop                                          stop the bundled Ollama container
 #
 # Paths are relative to the folder you run it from; cache/ and scores.csv are
-# written there too.
+# written there too. roles/ is shared with the container, so role edits apply
+# immediately.
 
 set -euo pipefail
 
@@ -19,9 +21,6 @@ IMAGE="hiring-agent"
 NETWORK="hiring-agent"
 OLLAMA_CONTAINER="hiring-agent-ollama"
 OLLAMA_VOLUME="hiring-agent-ollama"
-
-GEMINI_MODELS="gemini-2.5-flash gemini-2.5-pro gemini-2.5-flash-lite gemini-2.0-flash gemini-2.0-flash-lite"
-OLLAMA_MODELS="gemma3:4b gemma3:12b gemma3:1b qwen3:4b qwen3:1.7b mistral:7b"
 
 die() { echo "Error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -36,27 +35,28 @@ env_get() {
   grep -E "^$1=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- || true
 }
 
-# choose "prompt" "space separated options" -> echoes the picked option
+# choose "prompt" "newline separated options" [default] -> echoes the picked option
 choose() {
-  local prompt="$1" options="$2" i=1 opt reply
+  local prompt="$1" options="$2" default="${3:-1}" count reply
+  count="$(printf '%s\n' "$options" | grep -c .)"
   echo "$prompt" >&2
-  for opt in $options; do
-    echo "  $i) $opt" >&2
-    i=$((i + 1))
-  done
-  echo "  $i) other (type a model name)" >&2
+  printf '%s\n' "$options" | awk '{ printf "  %d) %s\n", NR, $0 }' >&2
   while true; do
-    read -r -p "Choice [1]: " reply
-    reply="${reply:-1}"
-    if [ "$reply" = "$i" ]; then
-      read -r -p "Model name: " reply
-      [ -n "$reply" ] && { echo "$reply"; return; }
-    elif [ "$reply" -ge 1 ] 2>/dev/null && [ "$reply" -lt "$i" ]; then
-      echo "$options" | tr ' ' '\n' | sed -n "${reply}p"
+    read -r -p "Choice [$default]: " reply
+    reply="${reply:-$default}"
+    if [ "$reply" -ge 1 ] 2>/dev/null && [ "$reply" -le "$count" ]; then
+      printf '%s\n' "$options" | sed -n "${reply}p"
       return
     fi
-    echo "Please pick a number from the list." >&2
+    echo "Please pick a number from 1 to $count." >&2
   done
+}
+
+# Read providers.json through the image, so the host needs nothing but Docker.
+# providers_json "<python iterable over c>" -> one line per item
+providers_json() {
+  docker run --rm --entrypoint python "$IMAGE" -c \
+    "import json; c = json.load(open('/app/providers.json')); print('\n'.join($1))"
 }
 
 build_image() {
@@ -110,67 +110,59 @@ setup() {
     case "$reply" in y|Y|yes|YES) ;; *) echo "Keeping existing settings."; exit 0 ;; esac
   fi
 
+  info "Building the hiring-agent image"
+  build_image
   echo
-  echo "Which model backend do you want to use?"
-  echo "  1) Google Gemini (needs an API key, fast, no local hardware needed)"
-  echo "  2) Ollama (free, runs models locally)"
-  local backend
-  while true; do
-    read -r -p "Choice [1]: " backend
-    backend="${backend:-1}"
-    case "$backend" in 1|2) break ;; *) echo "Please enter 1 or 2." ;; esac
-  done
 
-  local provider model gemini_key="" ollama_mode=""
+  local provider model key_env="" api_key="" ollama_mode=""
+  provider="$(choose "Which provider should score resumes? (from providers.json)" \
+    "$(providers_json "c['providers']")")"
+  key_env="$(providers_json "[c['providers']['$provider'].get('api_key_env') or '']")"
 
-  if [ "$backend" = "1" ]; then
-    provider="gemini"
+  echo
+  model="$(choose "Model:" "$(providers_json "c['providers']['$provider']['models']")")"
+
+  if [ -n "$key_env" ]; then
     echo
-    echo "Get a key at https://aistudio.google.com/api-keys"
-    while [ -z "$gemini_key" ]; do
-      read -r -s -p "Gemini API key (input hidden): " gemini_key
+    case "$provider" in
+      gemini) echo "Get a key at https://aistudio.google.com/api-keys" ;;
+      anthropic) echo "Get a key at https://platform.claude.com/settings/keys (uses Console API credits, not a claude.ai plan)" ;;
+    esac
+    while [ -z "$api_key" ]; do
+      read -r -s -p "$key_env (input hidden): " api_key
       echo
     done
+  fi
+
+  if [ "$provider" = "ollama" ]; then
     echo
-    model="$(choose "Gemini model:" "$GEMINI_MODELS")"
-    case " $GEMINI_MODELS " in
-      *" $model "*) ;;
-      *) echo "Note: '$model' is not in prompt.py's MODEL_PROVIDER_MAPPING, so the agent would route it to Ollama. Add it there first." >&2 ;;
-    esac
-  else
-    provider="ollama"
-    echo
-    echo "Where should Ollama run?"
-    echo "  1) On this machine (already installed from ollama.com; uses your GPU / Apple Silicon)"
-    echo "  2) Inside Docker (nothing to install; CPU-only on macOS, so much slower)"
     local default_mode=2
     [ "$(uname -s)" = "Darwin" ] && default_mode=1
-    while true; do
-      read -r -p "Choice [$default_mode]: " ollama_mode
-      ollama_mode="${ollama_mode:-$default_mode}"
-      case "$ollama_mode" in 1|2) break ;; *) echo "Please enter 1 or 2." ;; esac
-    done
-    echo
-    model="$(choose "Ollama model:" "$OLLAMA_MODELS")"
+    ollama_mode="$(choose "Where should Ollama run?" \
+"On this machine (installed from ollama.com; uses your GPU / Apple Silicon)
+Inside Docker (nothing to install; CPU-only on macOS, so much slower)" "$default_mode")"
 
-    if [ "$ollama_mode" = "1" ]; then
-      ollama_mode="host"
-      if ! curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
-        echo
-        echo "Warning: Ollama is not answering on localhost:11434. Install it from https://ollama.com and run 'ollama serve'."
-      elif command -v ollama >/dev/null 2>&1 && ! ollama show "$model" >/dev/null 2>&1; then
-        info "Pulling $model with your local Ollama"
-        ollama pull "$model"
-      fi
-      if [ "$(uname -s)" = "Linux" ]; then
-        echo "Linux note: containers can only reach Ollama if it listens beyond localhost."
-        echo "Start it with: OLLAMA_HOST=0.0.0.0 ollama serve"
-      fi
-    else
-      ollama_mode="docker"
-      start_bundled_ollama
-      ensure_bundled_model "$model"
-    fi
+    case "$ollama_mode" in
+      "On this machine"*)
+        ollama_mode="host"
+        if ! curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+          echo
+          echo "Warning: Ollama is not answering on localhost:11434. Install it from https://ollama.com and run 'ollama serve'."
+        elif command -v ollama >/dev/null 2>&1 && ! ollama show "$model" >/dev/null 2>&1; then
+          info "Pulling $model with your local Ollama"
+          ollama pull "$model"
+        fi
+        if [ "$(uname -s)" = "Linux" ]; then
+          echo "Linux note: containers can only reach Ollama if it listens beyond localhost."
+          echo "Start it with: OLLAMA_HOST=0.0.0.0 ollama serve"
+        fi
+        ;;
+      *)
+        ollama_mode="docker"
+        start_bundled_ollama
+        ensure_bundled_model "$model"
+        ;;
+    esac
   fi
 
   echo
@@ -186,21 +178,20 @@ setup() {
 # Written by hiring-agent.sh setup. Rerun setup to change.
 LLM_PROVIDER=$provider
 DEFAULT_MODEL=$model
-GEMINI_API_KEY=$gemini_key
 GITHUB_TOKEN=$github_token
 OLLAMA_MODE=$ollama_mode
 EOF
+  if [ -n "$key_env" ]; then
+    echo "$key_env=$api_key" >> "$ENV_FILE"
+  fi
   chmod 600 "$ENV_FILE"
 
   echo
-  info "Building the hiring-agent image"
-  build_image
-
-  echo
   info "Setup complete ($provider, $model). Settings saved to $ENV_FILE"
+  echo "Roles available: $(ls "$SCRIPT_DIR/roles" | tr '\n' ' ')"
   echo "Next:"
-  echo "  $0 batch applicants.xlsx resumes/ -o scores.csv"
-  echo "  $0 score resume.pdf"
+  echo "  $0 batch applicants.xlsx resumes/ --role <role> -o scores.csv"
+  echo "  $0 score resume.pdf --role <role>"
 }
 
 abs_path() {
@@ -225,19 +216,20 @@ run_agent() {
     --user "$(id -u):$(id -g)"
     -e HOME=/tmp
     --add-host=host.docker.internal:host-gateway
+    -v "$SCRIPT_DIR/roles:/app/roles"
     -v "$PWD:$PWD" -w "$PWD"
   )
   [ -t 0 ] && [ -t 1 ] && docker_args+=(-t)
 
-  # OLLAMA_HOST is set here rather than in .env so local (non-Docker) runs keep
-  # talking to localhost.
+  # OLLAMA_BASE_URL is set here rather than in .env so local (non-Docker) runs
+  # keep using providers.json's localhost URL.
   if [ "$(env_get LLM_PROVIDER)" = "ollama" ]; then
     if [ "$(env_get OLLAMA_MODE)" = "docker" ]; then
       start_bundled_ollama
       ensure_bundled_model "$(env_get DEFAULT_MODEL)"
-      docker_args+=(--network "$NETWORK" -e "OLLAMA_HOST=http://$OLLAMA_CONTAINER:11434")
+      docker_args+=(--network "$NETWORK" -e "OLLAMA_BASE_URL=http://$OLLAMA_CONTAINER:11434/v1")
     else
-      docker_args+=(-e "OLLAMA_HOST=http://host.docker.internal:11434")
+      docker_args+=(-e "OLLAMA_BASE_URL=http://host.docker.internal:11434/v1")
     fi
   fi
 
@@ -263,7 +255,7 @@ run_agent() {
 }
 
 usage() {
-  sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in

@@ -6,7 +6,7 @@ row to a PDF in a resumes folder, runs the normal scoring pipeline on it, and
 writes every original column plus the scores to a CSV sorted by total score.
 
 Usage:
-    python batch_score.py applicants.xlsx resumes/ -o scores.csv
+    python batch_score.py applicants.xlsx resumes/ --role software_engineering_intern -o scores.csv
 """
 
 import argparse
@@ -18,6 +18,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from models import build_evaluation_model
+from roles import Role, list_available_roles, load_role
 from score import score_resume, calculate_total_score
 
 logger = logging.getLogger(__name__)
@@ -26,24 +28,26 @@ logger = logging.getLogger(__name__)
 # with several attachments separated by commas.
 PDF_NAME_PATTERN = re.compile(r"([^,()\n]+?\.pdf)\b", re.IGNORECASE)
 
-SCORE_COLUMNS = [
-    "rank",
-    "total_score",
-    "max_score",
-    "open_source_score",
-    "self_projects_score",
-    "production_score",
-    "technical_skills_score",
-    "bonus_points",
-    "deductions",
-    "key_strengths",
-    "areas_for_improvement",
-    "matched_resume",
-    "scoring_status",
-]
+
+def score_columns(role: Role) -> List[str]:
+    """Columns appended to the sheet; category columns come from the role."""
+    return (
+        ["rank", "total_score", "max_score"]
+        + [f"{c.key}_score" for c in role.categories]
+        + [
+            "bonus_points",
+            "deductions",
+            "key_strengths",
+            "areas_for_improvement",
+            "matched_resume",
+            "scoring_status",
+        ]
+    )
 
 
-def read_sheet(path: Path, sheet_name: Optional[str] = None) -> Tuple[List[str], List[Dict]]:
+def read_sheet(
+    path: Path, sheet_name: Optional[str] = None
+) -> Tuple[List[str], List[Dict]]:
     """Read a .xlsx/.xlsm or .csv file into (headers, rows)."""
     suffix = path.suffix.lower()
 
@@ -176,20 +180,14 @@ def match_resume(
     return None
 
 
-def evaluation_columns(evaluation) -> Dict:
-    total_score, max_score = calculate_total_score(evaluation)
-    scores = evaluation.scores
+def evaluation_columns(evaluation, role: Role) -> Dict:
+    total_score, max_score = calculate_total_score(evaluation, role)
+    columns = {"total_score": round(total_score, 2), "max_score": max_score}
+    for category in role.categories:
+        category_score = getattr(evaluation.scores, category.key)
+        columns[f"{category.key}_score"] = min(category_score.score, category.max)
     return {
-        "total_score": round(total_score, 2),
-        "max_score": max_score,
-        "open_source_score": min(scores.open_source.score, scores.open_source.max),
-        "self_projects_score": min(
-            scores.self_projects.score, scores.self_projects.max
-        ),
-        "production_score": min(scores.production.score, scores.production.max),
-        "technical_skills_score": min(
-            scores.technical_skills.score, scores.technical_skills.max
-        ),
+        **columns,
         "bonus_points": evaluation.bonus_points.total,
         "deductions": evaluation.deductions.total,
         "key_strengths": " | ".join(evaluation.key_strengths),
@@ -197,7 +195,7 @@ def evaluation_columns(evaluation) -> Dict:
     }
 
 
-def write_ranked_csv(output: Path, headers: List[str], rows: List[Dict]):
+def write_ranked_csv(output: Path, headers: List[str], rows: List[Dict], role: Role):
     """Sort scored rows by total score (unscored rows last) and write the CSV."""
     scored = [r for r in rows if r.get("total_score") not in (None, "")]
     unscored = [r for r in rows if r.get("total_score") in (None, "")]
@@ -210,10 +208,12 @@ def write_ranked_csv(output: Path, headers: List[str], rows: List[Dict]):
             previous_rank, previous_score = position, row["total_score"]
         row["rank"] = previous_rank
 
-    extra = [c for c in SCORE_COLUMNS if c not in headers]
-    fieldnames = ["rank"] + [h for h in headers if h != "rank"] + [
-        c for c in extra if c != "rank"
-    ]
+    extra = [c for c in score_columns(role) if c not in headers]
+    fieldnames = (
+        ["rank"]
+        + [h for h in headers if h != "rank"]
+        + [c for c in extra if c != "rank"]
+    )
 
     # utf-8-sig so Excel opens names with accents correctly.
     with open(output, "w", newline="", encoding="utf-8-sig") as f:
@@ -228,6 +228,13 @@ def main():
     )
     parser.add_argument("sheet", type=Path, help="Applicant sheet (.xlsx or .csv)")
     parser.add_argument("resumes", type=Path, help="Folder containing resume PDFs")
+    available_roles = list_available_roles()
+    parser.add_argument(
+        "--role",
+        required=True,
+        help="Role to score against (a directory name under roles/). "
+        + (f"Available: {', '.join(available_roles)}" if available_roles else ""),
+    )
     parser.add_argument(
         "-o", "--output", type=Path, default=Path("scores.csv"), help="Output CSV path"
     )
@@ -243,6 +250,12 @@ def main():
         sys.exit(f"Error: sheet '{args.sheet}' does not exist.")
     if not args.resumes.is_dir():
         sys.exit(f"Error: resumes folder '{args.resumes}' does not exist.")
+
+    try:
+        role = load_role(args.role)
+    except ValueError as e:
+        sys.exit(f"Error: {e}")
+    evaluation_model = build_evaluation_model(role)
 
     headers, rows = read_sheet(args.sheet, args.sheet_name)
     if not rows:
@@ -273,7 +286,9 @@ def main():
 
     try:
         for i, row in enumerate(rows, 1):
-            pdf_path = match_resume(row, index, resume_column, name_column, email_column)
+            pdf_path = match_resume(
+                row, index, resume_column, name_column, email_column
+            )
             label = row.get(name_column, "") if name_column else f"row {i}"
             if pdf_path is None:
                 print(f"[{i}/{len(rows)}] {label}: no matching resume found, skipping")
@@ -284,14 +299,14 @@ def main():
             if pdf_path not in results:
                 print(f"[{i}/{len(rows)}] {label}: scoring {pdf_path.name}")
                 try:
-                    result = score_resume(str(pdf_path))
+                    result = score_resume(str(pdf_path), role, evaluation_model)
                     if result is None or result[0] is None:
                         results[pdf_path] = {
                             "scoring_status": "extraction failed (unreadable PDF or model unreachable)"
                         }
                     else:
                         results[pdf_path] = {
-                            **evaluation_columns(result[0]),
+                            **evaluation_columns(result[0], role),
                             "scoring_status": "scored",
                         }
                 except Exception as e:
@@ -301,7 +316,7 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted, writing results scored so far...")
     finally:
-        write_ranked_csv(args.output, headers, rows)
+        write_ranked_csv(args.output, headers, rows, role)
 
     scored = sum(1 for r in rows if r.get("scoring_status") == "scored")
     print(f"\nScored {scored}/{len(rows)} applicants. Ranked results: {args.output}")
