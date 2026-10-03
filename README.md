@@ -1,5 +1,8 @@
 # Hiring Agent
 
+> [!NOTE]
+> Used for GDG KIIT's 2025 recruitment (500+ applications, shortlisting cut from 2 weeks to 3 days, every shortlist human-reviewed). Published Oct 2026; v2 with a web frontend in progress for the 2026 cycle.
+
 <p align="center"><strong>Resume-to-Score pipeline</strong> that extracts structured data from PDFs, enriches with GitHub signals, and outputs a fair, explainable evaluation.</p>
 
 <p align="center">
@@ -18,7 +21,8 @@
 
 ## Contents
 
-- [Context and intent](#context-and-intent)
+- [About this fork](#about-this-fork)
+- [Upstream context](#upstream-context)
 - [Coverage](#coverage)
 - [Overview](#overview)
 - [Architecture](#architecture)
@@ -36,7 +40,24 @@
 
 ---
 
-## Context and intent
+## About this fork
+
+> **Status: under development** for GDG KIIT's 2026 recruitment cycle.
+
+This is a fork of [interviewstreet/hiring-agent](https://github.com/interviewstreet/hiring-agent), adapted for GDG KIIT's recruitment and kept up to date with upstream. On top of the upstream pipeline, it adds:
+
+- **Batch ranking** ([`batch_score.py`](#batch-scoring-and-ranking)): score a whole applicant sheet, such as an Airtable export, against a folder of resume PDFs and get one ranked `scores.csv` with the original columns intact.
+- **Docker setup** ([`hiring-agent.sh`](#docker-setup)): an interactive setup that asks for a provider and API key (or Ollama), then runs the agent without a local Python install.
+
+Every shortlist is reviewed by a person.
+
+**In progress for 2026:** v2 with a web frontend.
+
+---
+
+## Upstream context
+
+*This section is from the upstream HackerRank project and describes how HackerRank uses it.*
 
 This project got a lot of attention recently, and some of the discussion surfaced misconceptions worth addressing directly.
 
@@ -59,7 +80,7 @@ The repo ships with `gemma4:latest` as the default because it runs locally on mo
 
 ## Coverage
 
-Articles and discussions that have shaped how we think about improving this project:
+Articles and discussions about the upstream project that have shaped how it is being improved:
 
 | Article | Key takeaway |
 |---|---|
