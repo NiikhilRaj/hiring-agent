@@ -8,6 +8,8 @@ cache/
 resume_evaluations.csv
 scores.csv
 resume_evaluations_*.csv
+# GDG rubrics stay private so applicants can't tune resumes to them
+roles/gdg_*/
 greenhouse_resumes/*
 CLAUDE.md
 

@@ -51,6 +51,8 @@ This is a fork of [interviewstreet/hiring-agent](https://github.com/interviewstr
 
 Every shortlist is reviewed by a person.
 
+GDG's domain rubrics (`roles/gdg_*`) are kept private so applicants can't tune their resumes to them; `roles/software_engineering_intern` shows the format.
+
 **In progress for 2026:** v2 with a web frontend.
 
 ---
